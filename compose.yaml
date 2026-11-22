@@ -1,7 +1,9 @@
 services:
   meshcore2mqtt:
     build: .
-    image: meshcore2mqtt:latest
+    image: meshcore2mqtt:local
+    # Always build from this repo; never try to pull from a registry
+    pull_policy: build
     container_name: meshcore2mqtt
     restart: unless-stopped
     # Locally: copy .env.example to .env. In Komodo: set the variables in the
