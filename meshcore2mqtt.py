@@ -18,7 +18,11 @@ Topics (PREFIX defaults to "meshcore"):
   Channel slug = lowercased name with anything but a-z 0-9 - _ removed,
   e.g. "#yorkshire" -> "yorkshire", "Tapton" -> "tapton". Names are stable
   across devices; slot indexes are not.
-    {PREFIX}/tx/dm/{name|pubkey}    send a DM to a contact (name or key prefix)
+    {PREFIX}/tx/dm/{name|pubkey}    send a DM to a contact (name or key prefix),
+                                    retried until ACK (DM_MAX_ATTEMPTS)
+    {PREFIX}/cmd/advert             send an advert (payload "flood" for flood)
+    {PREFIX}/cmd/refresh            re-read contacts and channels
+    {PREFIX}/cmd/result             JSON result of each command (published)
 
   TX payload is either plain text, or JSON: {"text": "...", "id": "optional"}
 """
@@ -67,6 +71,7 @@ TX_MAX_BYTES = env("TX_MAX_BYTES", 140, int)  # per-message UTF-8 byte limit
 TX_MAX_PARTS = env("TX_MAX_PARTS", 3, int)  # max chunks a long message is split into
 TX_MAX_AGE = env("TX_MAX_AGE", 120, int)  # drop queued sends older than this (s)
 TX_QUEUE_SIZE = env("TX_QUEUE_SIZE", 20, int)
+DM_MAX_ATTEMPTS = env("DM_MAX_ATTEMPTS", 3, int)  # DM retries until ACK (falls back to flood)
 
 RECONNECT_DELAY = env("RECONNECT_DELAY", 10, int)
 LOG_LEVEL = env("LOG_LEVEL", "INFO")
@@ -152,6 +157,7 @@ class Bridge:
         self.channels: dict[int, str] = {}  # idx -> name
         self.slugs: dict[int, str] = {}  # idx -> slug
         self.channel_lock = asyncio.Lock()
+        self.bg_tasks: set[asyncio.Task] = set()
         self.node_info: dict = {}
         self.tx_queue: asyncio.Queue[TxJob] = asyncio.Queue(maxsize=TX_QUEUE_SIZE)
         self.stopping = asyncio.Event()
@@ -213,6 +219,12 @@ class Bridge:
         p = event.payload
         prefix = p.get("pubkey_prefix", "")
         contact = self.mc.get_contact_by_key_prefix(prefix) if self.mc else None
+        if contact is None and self.mc is not None:
+            try:  # contact may have been auto-added since we last synced
+                await self.mc.commands.get_contacts()
+                contact = self.mc.get_contact_by_key_prefix(prefix)
+            except Exception as e:
+                log.debug("contact refresh failed: %s", e)
         msg = {
             "pubkey_prefix": prefix,
             "sender": contact.get("adv_name") if contact else None,
@@ -289,6 +301,7 @@ class Bridge:
                     "tx_power": info.get("tx_power"),
                 }
                 await mc.ensure_contacts()
+                mc.auto_update_contacts = True  # keep contacts synced as adverts arrive
                 await self.load_channels()
                 await mc.start_auto_message_fetching()
 
@@ -323,8 +336,41 @@ class Bridge:
                     pass
 
     # ------------------------------------------------------------- MQTT loop
-    async def handle_tx_message(self, message: aiomqtt.Message):
+    async def handle_cmd(self, cmd: str, arg: str):
+        """{PREFIX}/cmd/advert  (payload "flood" for a flood advert, else zero-hop)
+           {PREFIX}/cmd/refresh (re-read contacts and channels)"""
+        result = {"cmd": cmd, "ok": False}
+        try:
+            if not self.mc_ready.is_set():
+                raise ConnectionError("node not connected")
+            if cmd == "advert":
+                flood = arg.strip().lower() == "flood"
+                res = await self.mc.commands.send_advert(flood=flood)
+                if res is None or res.type == EventType.ERROR:
+                    raise RuntimeError("node rejected advert")
+                result["flood"] = flood
+                log.info("Sent %s advert", "flood" if flood else "zero-hop")
+            elif cmd == "refresh":
+                await self.mc.commands.get_contacts()
+                await self.load_channels()
+                await self.publish_node_state()
+                result.update(contacts=len(self.mc.contacts), channels=len(self.channels))
+            else:
+                raise ValueError(f"unknown command '{cmd}'")
+            result["ok"] = True
+        except Exception as e:
+            log.warning("cmd %s failed: %s", cmd, e)
+            result["error"] = str(e)
+        await self.publish("cmd/result", result)
+
+    async def handle_message(self, message: aiomqtt.Message):
         topic = str(message.topic)
+        if topic.startswith(f"{PREFIX}/cmd/"):
+            arg = message.payload.decode("utf-8", "ignore") if message.payload else ""
+            task = asyncio.create_task(self.handle_cmd(topic[len(f"{PREFIX}/cmd/"):], arg))
+            self.bg_tasks.add(task)
+            task.add_done_callback(self.bg_tasks.discard)
+            return
         rest = topic[len(f"{PREFIX}/tx/"):]
         kind, _, target = rest.partition("/")
         if kind not in ("channel", "dm") or not target:
@@ -365,8 +411,9 @@ class Bridge:
                     await client.publish(f"{PREFIX}/status", "online", qos=1, retain=True)
                     await self.publish_node_state()
                     await client.subscribe(f"{PREFIX}/tx/#", qos=1)
+                    await client.subscribe(f"{PREFIX}/cmd/#", qos=1)
                     async for message in client.messages:
-                        await self.handle_tx_message(message)
+                        await self.handle_message(message)
             except aiomqtt.MqttError as e:
                 log.error("MQTT error: %s", e)
             finally:
@@ -396,7 +443,9 @@ class Bridge:
             contact = await self.resolve_contact(job.target)
             if contact is None:
                 raise LookupError(f"unknown contact '{job.target}'")
-            res = await mc.commands.send_msg(contact, part)
+            res = await mc.commands.send_msg_with_retry(contact, part, max_attempts=DM_MAX_ATTEMPTS)
+            if res is None:
+                raise TimeoutError(f"no ACK from '{job.target}' after {DM_MAX_ATTEMPTS} attempts")
         if res is None or res.type == EventType.ERROR:
             reason = res.payload.get("reason") if res else "timeout"
             raise RuntimeError(f"node rejected send: {reason}")

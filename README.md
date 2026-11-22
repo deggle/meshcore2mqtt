@@ -36,6 +36,9 @@ python meshcore2mqtt.py
 | `meshcore/tx/channel/<slug or idx>` | in | plain text, or `{"text":"...","id":"optional"}` |
 | `meshcore/tx/dm/<name or pubkey prefix>` | in | plain text, or `{"text":"...","id":"optional"}` |
 | `meshcore/tx/result` | out | `{id, kind, target, ok, parts?, error?}` |
+| `meshcore/cmd/advert` | in | empty for a zero-hop advert, `flood` for a flood advert |
+| `meshcore/cmd/refresh` | in | anything; re-reads contacts and channels |
+| `meshcore/cmd/result` | out | `{cmd, ok, error?, ...}` |
 
 Test with mosquitto clients:
 
@@ -59,6 +62,12 @@ A channel's index is just its slot on the device, which changes if you re-add ch
 - The channel list is re-read on reconnect, when a message arrives on an unknown index, and when a send names an unknown channel.
 - When you move to a new device, add the channels with the same names (and, for private channels, the same secret). Topics stay the same.
 
+## Direct messages
+
+- DMs are sent with retries until the recipient ACKs: direct route first, then flood (`DM_MAX_ATTEMPTS`, default 3). If no ACK arrives, `tx/result` reports `ok: false`. The message may still have arrived; only the ACK was lost.
+- To DM the node, people need it in their contacts, so send an advert with `meshcore/cmd/advert`. The node must also know *them* to decrypt and reply, so turn on auto-add contacts on the device.
+- Contacts are kept in sync as adverts arrive, and re-read if a DM arrives from an unknown key.
+
 ## Airtime protection
 
 Outgoing messages go through a single queue:
@@ -72,3 +81,14 @@ Outgoing messages go through a single queue:
 - The bridge splits channel text `Sender: message` into `sender` and `text`.
 - Your own sent messages are not echoed back to `rx/`, so a bot replying through `tx/` can't loop on its own output.
 - The bridge reconnects automatically to both the node and the broker.
+
+## Example: local AI chatbot (Node-RED + Ollama)
+
+[`examples/node-red-ai-chatbot.json`](examples/node-red-ai-chatbot.json) is an importable Node-RED flow:
+
+- **Channel** (`rx/channel/tapton`): answers messages that start with `!ai`, in one mesh message. History is shared by the whole channel.
+- **DMs** (`rx/dm/+`): every DM is a question, no `!ai` needed. Each person has their own history, and replies can be up to 2 messages.
+- **Memory:** the last 4 exchanges per conversation, forgotten after 30 minutes of quiet. `!ai reset` on the channel, or `reset` by DM, clears it.
+- **Limits:** one question at a time, a per-sender cooldown (30 s channel, 10 s DM), and markdown and emoji are stripped.
+
+Edit `examples/ai-filter.js` and `examples/ai-format.js`, then run `python examples/build-flow.py` to rebuild the JSON. Node IDs and the broker config ID match a specific Node-RED install; change them in `build-flow.py` for yours.

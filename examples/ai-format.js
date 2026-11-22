@@ -1,6 +1,6 @@
-// Node-RED function: "format reply" - clean up and fit into one mesh message
-const MAX_BYTES = 135;
-const HISTORY_MESSAGES = 8; // 4 question/answer pairs kept as context
+// Node-RED function: "format reply" - clean up, fit to size, save history
+const MAX_BYTES = { channel: 135, dm: 270 };  // dm = 2 mesh messages (bridge splits)
+const HISTORY_MESSAGES = 8;                   // 4 question/answer pairs per conversation
 
 flow.set("ai_busy", 0);
 
@@ -17,21 +17,26 @@ if ((msg.statusCode && msg.statusCode !== 200) || !reply) {
     return null;
 }
 
-if (Buffer.byteLength(reply) > MAX_BYTES) {
+const max = MAX_BYTES[msg.source] || MAX_BYTES.channel;
+if (Buffer.byteLength(reply) > max) {
     let out = "";
     for (const word of reply.split(" ")) {
         const candidate = out ? `${out} ${word}` : word;
-        if (Buffer.byteLength(candidate + "…") > MAX_BYTES) break;
+        if (Buffer.byteLength(candidate + "…") > max) break;
         out = candidate;
     }
-    if (!out) out = Buffer.from(reply).subarray(0, MAX_BYTES - 3).toString().replace(/�$/, "");
+    if (!out) out = Buffer.from(reply).subarray(0, max - 3).toString().replace(/�$/, "");
     reply = out.replace(/[\s,;:]+$/, "") + "…";
 }
 
-const history = flow.get("ai_history") || [];
-history.push({ role: "user", content: `${msg.sender}: ${msg.question}` });
-history.push({ role: "assistant", content: reply });
-flow.set("ai_history", history.slice(-HISTORY_MESSAGES));
+const histories = flow.get("ai_history") || {};
+const h = histories[msg.historyKey] || { messages: [] };
+h.messages.push({ role: "user", content: msg.source === "dm" ? msg.question : `${msg.sender}: ${msg.question}` });
+h.messages.push({ role: "assistant", content: reply });
+h.messages = h.messages.slice(-HISTORY_MESSAGES);
+h.updated = Date.now() / 1000;
+histories[msg.historyKey] = h;
+flow.set("ai_history", histories);
 
-node.status({ fill: "green", shape: "dot", text: `replied to ${msg.sender}` });
-return { payload: reply };
+node.status({ fill: "green", shape: "dot", text: `replied to ${msg.sender} (${msg.source})` });
+return { topic: msg.reply_topic, payload: reply };

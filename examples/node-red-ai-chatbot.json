@@ -15,12 +15,13 @@
       "b7c1e2d3f4a50601",
       "b7c1e2d3f4a50602",
       "b7c1e2d3f4a50603",
-      "b7c1e2d3f4a50604"
+      "b7c1e2d3f4a50604",
+      "b7c1e2d3f4a50605"
     ],
     "x": 94,
     "y": 339,
     "w": 952,
-    "h": 182
+    "h": 222
   },
   {
     "id": "71f6c0a5f71f2485",
@@ -37,7 +38,29 @@
     "rh": 0,
     "inputs": 0,
     "x": 210,
-    "y": 400,
+    "y": 380,
+    "wires": [
+      [
+        "a31efbb9a0b66f87"
+      ]
+    ]
+  },
+  {
+    "id": "b7c1e2d3f4a50605",
+    "type": "mqtt in",
+    "z": "e8690753eb651967",
+    "g": "421b3bc7ca6833a7",
+    "name": "DMs rx",
+    "topic": "meshcore/rx/dm/+",
+    "qos": "1",
+    "datatype": "json",
+    "broker": "29ce661a.a836aa",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 210,
+    "y": 440,
     "wires": [
       [
         "a31efbb9a0b66f87"
@@ -50,7 +73,7 @@
     "z": "e8690753eb651967",
     "g": "421b3bc7ca6833a7",
     "name": "!ai filter",
-    "func": "const OLLAMA_URL = \"http://10.10.0.36:11434/api/chat\";\nconst MODEL = \"gemma3:4b\";\nconst TRIGGER = /^!ai\\b\\s*(.*)$/is;\nconst USER_COOLDOWN_S = 30;   // per sender\nconst BUSY_TIMEOUT_S = 120;   // one question at a time; stale lock expires\nconst SYSTEM_PROMPT =\n    \"You are TaptonBot, a friendly assistant on the Tapton channel of a MeshCore LoRa mesh radio network. \" +\n    \"Answer in ONE short sentence, under 120 characters. Plain text only: no markdown, no emoji, no lists. \" +\n    \"If you are not sure, say so briefly.\";\n\nconst p = (typeof msg.payload === \"string\") ? JSON.parse(msg.payload) : (msg.payload || {});\nconst m = (p.text || \"\").trim().match(TRIGGER);\nif (!m) return null;\n\nconst sender = p.sender || \"someone\";\nconst question = m[1].trim();\nif (!question) {\n    return [null, { payload: \"Ask me something: !ai <question>\" }];\n}\n\nconst now = Date.now() / 1000;\nif (now - (flow.get(\"ai_busy\") || 0) < BUSY_TIMEOUT_S) {\n    node.status({ fill: \"yellow\", shape: \"ring\", text: `busy, ignored ${sender}` });\n    return null;\n}\nconst last = flow.get(\"ai_last\") || {};\nif (now - (last[sender] || 0) < USER_COOLDOWN_S) {\n    node.status({ fill: \"yellow\", shape: \"ring\", text: `cooldown: ${sender}` });\n    return null;\n}\nlast[sender] = now;\nflow.set(\"ai_last\", last);\nflow.set(\"ai_busy\", now);\n\nconst history = flow.get(\"ai_history\") || [];\nmsg.sender = sender;\nmsg.question = question;\nmsg.url = OLLAMA_URL;\nmsg.method = \"POST\";\nmsg.headers = { \"content-type\": \"application/json\" };\nmsg.payload = {\n    model: MODEL,\n    stream: false,\n    keep_alive: \"10m\",\n    options: { num_predict: 60, temperature: 0.6 },\n    messages: [\n        { role: \"system\", content: SYSTEM_PROMPT },\n        ...history,\n        { role: \"user\", content: `${sender}: ${question}` },\n    ],\n};\nnode.status({ fill: \"blue\", shape: \"dot\", text: `thinking for ${sender}` });\nreturn [msg, null];\n",
+    "func": "// Handles channel messages (need \"!ai\") and DMs (no trigger needed).\nconst PREFIX = \"meshcore\";\nconst OLLAMA_URL = \"http://10.10.0.36:11434/api/chat\";\nconst MODEL = \"gemma3:4b\";\nconst TRIGGER = /^!ai\\b\\s*(.*)$/is;\nconst COOLDOWN_S = { channel: 30, dm: 10 };  // per sender\nconst BUSY_TIMEOUT_S = 120;                   // one question at a time; stale lock expires\nconst HISTORY_IDLE_S = 30 * 60;               // forget a conversation after 30 min quiet\nconst SYSTEM_PROMPT = {\n    channel:\n        \"You are TaptonBot, a friendly assistant on the Tapton channel of a MeshCore LoRa mesh radio network. \" +\n        \"Answer in ONE short sentence, under 120 characters. Plain text only: no markdown, no emoji, no lists. \" +\n        \"If you are not sure, say so briefly.\",\n    dm:\n        \"You are TaptonBot, a friendly assistant reached by direct message over a MeshCore LoRa mesh radio network. \" +\n        \"Answer in at most two short sentences, under 240 characters. Plain text only: no markdown, no emoji, no lists. \" +\n        \"If you are not sure, say so briefly.\",\n};\n\nconst p = (typeof msg.payload === \"string\") ? JSON.parse(msg.payload) : (msg.payload || {});\nconst source = String(msg.topic || \"\").includes(\"/rx/dm/\") ? \"dm\" : \"channel\";\nconst text = (p.text || \"\").trim();\n\nlet question;\nconst m = text.match(TRIGGER);\nif (source === \"channel\") {\n    if (!m) return null;\n    question = m[1].trim();\n} else {\n    question = (m ? m[1] : text).trim();\n}\n\nconst senderKey = source === \"dm\" ? p.pubkey_prefix : (p.sender || \"someone\");\nconst senderName = p.sender || (source === \"dm\" ? p.pubkey_prefix : \"someone\");\nconst replyTopic = source === \"dm\"\n    ? `${PREFIX}/tx/dm/${p.pubkey_prefix}`\n    : `${PREFIX}/tx/channel/${p.channel_slug || p.channel_idx}`;\nconst historyKey = source === \"dm\" ? `dm:${p.pubkey_prefix}` : `ch:${p.channel_slug || p.channel_idx}`;\nconst reply = (t) => [null, { topic: replyTopic, payload: t }];\n\nif (!senderKey) return null;\nif (!question) {\n    return source === \"dm\" ? null : reply(\"Ask me something: !ai <question>  (!ai reset clears my memory)\");\n}\n\nconst histories = flow.get(\"ai_history\") || {};\nif (/^reset$/i.test(question)) {\n    delete histories[historyKey];\n    flow.set(\"ai_history\", histories);\n    node.status({ fill: \"grey\", shape: \"ring\", text: `history reset by ${senderName}` });\n    return reply(\"OK, I've forgotten our conversation.\");\n}\n\nconst now = Date.now() / 1000;\nif (now - (flow.get(\"ai_busy\") || 0) < BUSY_TIMEOUT_S) {\n    node.status({ fill: \"yellow\", shape: \"ring\", text: `busy, ignored ${senderName}` });\n    return source === \"dm\" ? reply(\"Busy answering someone else, try again in a minute.\") : null;\n}\nconst last = flow.get(\"ai_last\") || {};\nconst cooldownKey = `${source}:${senderKey}`;\nif (now - (last[cooldownKey] || 0) < COOLDOWN_S[source]) {\n    node.status({ fill: \"yellow\", shape: \"ring\", text: `cooldown: ${senderName}` });\n    return null;\n}\nlast[cooldownKey] = now;\nflow.set(\"ai_last\", last);\nflow.set(\"ai_busy\", now);\n\nlet h = histories[historyKey];\nif (!h || now - h.updated > HISTORY_IDLE_S) h = { updated: now, messages: [] };\n\nmsg.source = source;\nmsg.sender = senderName;\nmsg.question = question;\nmsg.historyKey = historyKey;\nmsg.reply_topic = replyTopic;\nmsg.url = OLLAMA_URL;\nmsg.method = \"POST\";\nmsg.headers = { \"content-type\": \"application/json\" };\nmsg.payload = {\n    model: MODEL,\n    stream: false,\n    keep_alive: \"10m\",\n    options: { num_predict: source === \"dm\" ? 110 : 60, temperature: 0.6 },\n    messages: [\n        { role: \"system\", content: SYSTEM_PROMPT[source] },\n        ...h.messages,\n        { role: \"user\", content: source === \"dm\" ? question : `${senderName}: ${question}` },\n    ],\n};\nnode.status({ fill: \"blue\", shape: \"dot\", text: `thinking for ${senderName} (${source})` });\nreturn [msg, null];\n",
     "outputs": 2,
     "timeout": 0,
     "noerr": 0,
@@ -99,7 +122,7 @@
     "z": "e8690753eb651967",
     "g": "421b3bc7ca6833a7",
     "name": "format reply",
-    "func": "const MAX_BYTES = 135;\nconst HISTORY_MESSAGES = 8; // 4 question/answer pairs kept as context\n\nflow.set(\"ai_busy\", 0);\n\nlet reply = (msg.payload && msg.payload.message && msg.payload.message.content) || \"\";\nreply = reply\n    .replace(/<think>[\\s\\S]*?<\\/think>/g, \"\")\n    .replace(/[\\u{1F000}-\\u{1FAFF}\\u{2600}-\\u{27BF}\\u{FE0F}]/gu, \"\")\n    .replace(/[*_`#>]/g, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim();\n\nif ((msg.statusCode && msg.statusCode !== 200) || !reply) {\n    node.status({ fill: \"red\", shape: \"ring\", text: `no reply (HTTP ${msg.statusCode})` });\n    return null;\n}\n\nif (Buffer.byteLength(reply) > MAX_BYTES) {\n    let out = \"\";\n    for (const word of reply.split(\" \")) {\n        const candidate = out ? `${out} ${word}` : word;\n        if (Buffer.byteLength(candidate + \"\u2026\") > MAX_BYTES) break;\n        out = candidate;\n    }\n    if (!out) out = Buffer.from(reply).subarray(0, MAX_BYTES - 3).toString().replace(/\ufffd$/, \"\");\n    reply = out.replace(/[\\s,;:]+$/, \"\") + \"\u2026\";\n}\n\nconst history = flow.get(\"ai_history\") || [];\nhistory.push({ role: \"user\", content: `${msg.sender}: ${msg.question}` });\nhistory.push({ role: \"assistant\", content: reply });\nflow.set(\"ai_history\", history.slice(-HISTORY_MESSAGES));\n\nnode.status({ fill: \"green\", shape: \"dot\", text: `replied to ${msg.sender}` });\nreturn { payload: reply };\n",
+    "func": "const MAX_BYTES = { channel: 135, dm: 270 };  // dm = 2 mesh messages (bridge splits)\nconst HISTORY_MESSAGES = 8;                   // 4 question/answer pairs per conversation\n\nflow.set(\"ai_busy\", 0);\n\nlet reply = (msg.payload && msg.payload.message && msg.payload.message.content) || \"\";\nreply = reply\n    .replace(/<think>[\\s\\S]*?<\\/think>/g, \"\")\n    .replace(/[\\u{1F000}-\\u{1FAFF}\\u{2600}-\\u{27BF}\\u{FE0F}]/gu, \"\")\n    .replace(/[*_`#>]/g, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim();\n\nif ((msg.statusCode && msg.statusCode !== 200) || !reply) {\n    node.status({ fill: \"red\", shape: \"ring\", text: `no reply (HTTP ${msg.statusCode})` });\n    return null;\n}\n\nconst max = MAX_BYTES[msg.source] || MAX_BYTES.channel;\nif (Buffer.byteLength(reply) > max) {\n    let out = \"\";\n    for (const word of reply.split(\" \")) {\n        const candidate = out ? `${out} ${word}` : word;\n        if (Buffer.byteLength(candidate + \"\u2026\") > max) break;\n        out = candidate;\n    }\n    if (!out) out = Buffer.from(reply).subarray(0, max - 3).toString().replace(/\ufffd$/, \"\");\n    reply = out.replace(/[\\s,;:]+$/, \"\") + \"\u2026\";\n}\n\nconst histories = flow.get(\"ai_history\") || {};\nconst h = histories[msg.historyKey] || { messages: [] };\nh.messages.push({ role: \"user\", content: msg.source === \"dm\" ? msg.question : `${msg.sender}: ${msg.question}` });\nh.messages.push({ role: \"assistant\", content: reply });\nh.messages = h.messages.slice(-HISTORY_MESSAGES);\nh.updated = Date.now() / 1000;\nhistories[msg.historyKey] = h;\nflow.set(\"ai_history\", histories);\n\nnode.status({ fill: \"green\", shape: \"dot\", text: `replied to ${msg.sender} (${msg.source})` });\nreturn { topic: msg.reply_topic, payload: reply };\n",
     "outputs": 1,
     "timeout": 0,
     "noerr": 0,
@@ -120,8 +143,8 @@
     "type": "mqtt out",
     "z": "e8690753eb651967",
     "g": "421b3bc7ca6833a7",
-    "name": "Tapton tx",
-    "topic": "meshcore/tx/channel/tapton",
+    "name": "reply tx (msg.topic)",
+    "topic": "",
     "qos": "1",
     "retain": "false",
     "respTopic": "",
@@ -145,7 +168,7 @@
     ],
     "uncaught": false,
     "x": 570,
-    "y": 480,
+    "y": 520,
     "wires": [
       [
         "b7c1e2d3f4a50603"
@@ -166,7 +189,7 @@
     "finalize": "",
     "libs": [],
     "x": 740,
-    "y": 480,
+    "y": 520,
     "wires": [
       []
     ]
@@ -181,8 +204,8 @@
     "tosidebar": true,
     "console": false,
     "tostatus": false,
-    "complete": "payload",
-    "targetType": "msg",
+    "complete": "true",
+    "targetType": "full",
     "statusVal": "",
     "statusType": "auto",
     "x": 930,
