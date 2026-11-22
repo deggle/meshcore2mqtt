@@ -71,6 +71,7 @@ TX_MAX_BYTES = env("TX_MAX_BYTES", 140, int)  # per-message UTF-8 byte limit
 TX_MAX_PARTS = env("TX_MAX_PARTS", 3, int)  # max chunks a long message is split into
 TX_MAX_AGE = env("TX_MAX_AGE", 120, int)  # drop queued sends older than this (s)
 TX_QUEUE_SIZE = env("TX_QUEUE_SIZE", 20, int)
+COMMANDS = ("advert", "refresh")  # {PREFIX}/cmd/<name> topics the bridge acts on
 DM_MAX_ATTEMPTS = env("DM_MAX_ATTEMPTS", 3, int)  # DM retries until ACK (falls back to flood)
 
 RECONNECT_DELAY = env("RECONNECT_DELAY", 10, int)
@@ -366,8 +367,11 @@ class Bridge:
     async def handle_message(self, message: aiomqtt.Message):
         topic = str(message.topic)
         if topic.startswith(f"{PREFIX}/cmd/"):
+            cmd = topic[len(f"{PREFIX}/cmd/"):]
+            if cmd not in COMMANDS:  # never react to cmd/result (our own output)
+                return
             arg = message.payload.decode("utf-8", "ignore") if message.payload else ""
-            task = asyncio.create_task(self.handle_cmd(topic[len(f"{PREFIX}/cmd/"):], arg))
+            task = asyncio.create_task(self.handle_cmd(cmd, arg))
             self.bg_tasks.add(task)
             task.add_done_callback(self.bg_tasks.discard)
             return
@@ -411,7 +415,9 @@ class Bridge:
                     await client.publish(f"{PREFIX}/status", "online", qos=1, retain=True)
                     await self.publish_node_state()
                     await client.subscribe(f"{PREFIX}/tx/#", qos=1)
-                    await client.subscribe(f"{PREFIX}/cmd/#", qos=1)
+                    # specific topics only: cmd/result is ours and must not loop back
+                    for cmd in COMMANDS:
+                        await client.subscribe(f"{PREFIX}/cmd/{cmd}", qos=1)
                     async for message in client.messages:
                         await self.handle_message(message)
             except aiomqtt.MqttError as e:
