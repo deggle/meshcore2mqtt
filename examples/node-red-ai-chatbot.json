@@ -1,0 +1,192 @@
+[
+  {
+    "id": "421b3bc7ca6833a7",
+    "type": "group",
+    "z": "e8690753eb651967",
+    "name": "Meshcore Local AI",
+    "style": {
+      "label": true
+    },
+    "nodes": [
+      "71f6c0a5f71f2485",
+      "a31efbb9a0b66f87",
+      "d882334f0492f174",
+      "0ca0d65d5714ecf1",
+      "b7c1e2d3f4a50601",
+      "b7c1e2d3f4a50602",
+      "b7c1e2d3f4a50603",
+      "b7c1e2d3f4a50604"
+    ],
+    "x": 94,
+    "y": 339,
+    "w": 952,
+    "h": 182
+  },
+  {
+    "id": "71f6c0a5f71f2485",
+    "type": "mqtt in",
+    "z": "e8690753eb651967",
+    "g": "421b3bc7ca6833a7",
+    "name": "Tapton rx",
+    "topic": "meshcore/rx/channel/tapton",
+    "qos": "1",
+    "datatype": "json",
+    "broker": "29ce661a.a836aa",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 210,
+    "y": 400,
+    "wires": [
+      [
+        "a31efbb9a0b66f87"
+      ]
+    ]
+  },
+  {
+    "id": "a31efbb9a0b66f87",
+    "type": "function",
+    "z": "e8690753eb651967",
+    "g": "421b3bc7ca6833a7",
+    "name": "!ai filter",
+    "func": "const OLLAMA_URL = \"http://10.10.0.36:11434/api/chat\";\nconst MODEL = \"gemma3:4b\";\nconst TRIGGER = /^!ai\\b\\s*(.*)$/is;\nconst USER_COOLDOWN_S = 30;   // per sender\nconst BUSY_TIMEOUT_S = 120;   // one question at a time; stale lock expires\nconst SYSTEM_PROMPT =\n    \"You are TaptonBot, a friendly assistant on the Tapton channel of a MeshCore LoRa mesh radio network. \" +\n    \"Answer in ONE short sentence, under 120 characters. Plain text only: no markdown, no emoji, no lists. \" +\n    \"If you are not sure, say so briefly.\";\n\nconst p = (typeof msg.payload === \"string\") ? JSON.parse(msg.payload) : (msg.payload || {});\nconst m = (p.text || \"\").trim().match(TRIGGER);\nif (!m) return null;\n\nconst sender = p.sender || \"someone\";\nconst question = m[1].trim();\nif (!question) {\n    return [null, { payload: \"Ask me something: !ai <question>\" }];\n}\n\nconst now = Date.now() / 1000;\nif (now - (flow.get(\"ai_busy\") || 0) < BUSY_TIMEOUT_S) {\n    node.status({ fill: \"yellow\", shape: \"ring\", text: `busy, ignored ${sender}` });\n    return null;\n}\nconst last = flow.get(\"ai_last\") || {};\nif (now - (last[sender] || 0) < USER_COOLDOWN_S) {\n    node.status({ fill: \"yellow\", shape: \"ring\", text: `cooldown: ${sender}` });\n    return null;\n}\nlast[sender] = now;\nflow.set(\"ai_last\", last);\nflow.set(\"ai_busy\", now);\n\nconst history = flow.get(\"ai_history\") || [];\nmsg.sender = sender;\nmsg.question = question;\nmsg.url = OLLAMA_URL;\nmsg.method = \"POST\";\nmsg.headers = { \"content-type\": \"application/json\" };\nmsg.payload = {\n    model: MODEL,\n    stream: false,\n    keep_alive: \"10m\",\n    options: { num_predict: 60, temperature: 0.6 },\n    messages: [\n        { role: \"system\", content: SYSTEM_PROMPT },\n        ...history,\n        { role: \"user\", content: `${sender}: ${question}` },\n    ],\n};\nnode.status({ fill: \"blue\", shape: \"dot\", text: `thinking for ${sender}` });\nreturn [msg, null];\n",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 400,
+    "y": 400,
+    "wires": [
+      [
+        "d882334f0492f174"
+      ],
+      [
+        "0ca0d65d5714ecf1"
+      ]
+    ]
+  },
+  {
+    "id": "d882334f0492f174",
+    "type": "http request",
+    "z": "e8690753eb651967",
+    "g": "421b3bc7ca6833a7",
+    "name": "Ollama",
+    "method": "use",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 570,
+    "y": 400,
+    "wires": [
+      [
+        "b7c1e2d3f4a50601"
+      ]
+    ]
+  },
+  {
+    "id": "b7c1e2d3f4a50601",
+    "type": "function",
+    "z": "e8690753eb651967",
+    "g": "421b3bc7ca6833a7",
+    "name": "format reply",
+    "func": "const MAX_BYTES = 135;\nconst HISTORY_MESSAGES = 8; // 4 question/answer pairs kept as context\n\nflow.set(\"ai_busy\", 0);\n\nlet reply = (msg.payload && msg.payload.message && msg.payload.message.content) || \"\";\nreply = reply\n    .replace(/<think>[\\s\\S]*?<\\/think>/g, \"\")\n    .replace(/[\\u{1F000}-\\u{1FAFF}\\u{2600}-\\u{27BF}\\u{FE0F}]/gu, \"\")\n    .replace(/[*_`#>]/g, \"\")\n    .replace(/\\s+/g, \" \")\n    .trim();\n\nif ((msg.statusCode && msg.statusCode !== 200) || !reply) {\n    node.status({ fill: \"red\", shape: \"ring\", text: `no reply (HTTP ${msg.statusCode})` });\n    return null;\n}\n\nif (Buffer.byteLength(reply) > MAX_BYTES) {\n    let out = \"\";\n    for (const word of reply.split(\" \")) {\n        const candidate = out ? `${out} ${word}` : word;\n        if (Buffer.byteLength(candidate + \"\u2026\") > MAX_BYTES) break;\n        out = candidate;\n    }\n    if (!out) out = Buffer.from(reply).subarray(0, MAX_BYTES - 3).toString().replace(/\ufffd$/, \"\");\n    reply = out.replace(/[\\s,;:]+$/, \"\") + \"\u2026\";\n}\n\nconst history = flow.get(\"ai_history\") || [];\nhistory.push({ role: \"user\", content: `${msg.sender}: ${msg.question}` });\nhistory.push({ role: \"assistant\", content: reply });\nflow.set(\"ai_history\", history.slice(-HISTORY_MESSAGES));\n\nnode.status({ fill: \"green\", shape: \"dot\", text: `replied to ${msg.sender}` });\nreturn { payload: reply };\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 740,
+    "y": 400,
+    "wires": [
+      [
+        "0ca0d65d5714ecf1",
+        "b7c1e2d3f4a50604"
+      ]
+    ]
+  },
+  {
+    "id": "0ca0d65d5714ecf1",
+    "type": "mqtt out",
+    "z": "e8690753eb651967",
+    "g": "421b3bc7ca6833a7",
+    "name": "Tapton tx",
+    "topic": "meshcore/tx/channel/tapton",
+    "qos": "1",
+    "retain": "false",
+    "respTopic": "",
+    "contentType": "",
+    "userProps": "",
+    "correl": "",
+    "expiry": "",
+    "broker": "29ce661a.a836aa",
+    "x": 950,
+    "y": 400,
+    "wires": []
+  },
+  {
+    "id": "b7c1e2d3f4a50602",
+    "type": "catch",
+    "z": "e8690753eb651967",
+    "g": "421b3bc7ca6833a7",
+    "name": "Ollama errors",
+    "scope": [
+      "d882334f0492f174"
+    ],
+    "uncaught": false,
+    "x": 570,
+    "y": 480,
+    "wires": [
+      [
+        "b7c1e2d3f4a50603"
+      ]
+    ]
+  },
+  {
+    "id": "b7c1e2d3f4a50603",
+    "type": "function",
+    "z": "e8690753eb651967",
+    "g": "421b3bc7ca6833a7",
+    "name": "unlock",
+    "func": "flow.set(\"ai_busy\", 0);\nnode.status({ fill: \"red\", shape: \"ring\", text: msg.error && msg.error.message });\nreturn null;\n",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 740,
+    "y": 480,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "b7c1e2d3f4a50604",
+    "type": "debug",
+    "z": "e8690753eb651967",
+    "g": "421b3bc7ca6833a7",
+    "name": "reply",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 930,
+    "y": 460,
+    "wires": []
+  }
+]

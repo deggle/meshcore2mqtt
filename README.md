@@ -30,10 +30,10 @@ python meshcore2mqtt.py
 |---|---|---|
 | `meshcore/status` | out (retained) | `online` / `offline` (offline is also the MQTT last will) |
 | `meshcore/node` | out (retained) | node name, public key, radio settings, `connected` |
-| `meshcore/channels` | out (retained) | `[{"idx":0,"name":"Public"}, ...]` |
-| `meshcore/rx/channel/<idx>` | out | `{channel_idx, channel_name, sender, text, raw_text, snr, path_len, sender_timestamp, received_at}` |
+| `meshcore/channels` | out (retained) | `[{"idx":2,"name":"Tapton","slug":"tapton"}, ...]` |
+| `meshcore/rx/channel/<slug>` | out | `{channel_idx, channel_name, channel_slug, sender, text, raw_text, snr, path_len, sender_timestamp, received_at}` |
 | `meshcore/rx/dm/<pubkey_prefix>` | out | `{pubkey_prefix, sender, text, snr, path_len, sender_timestamp, received_at}` |
-| `meshcore/tx/channel/<idx>` | in | plain text, or `{"text":"...","id":"optional"}` |
+| `meshcore/tx/channel/<slug or idx>` | in | plain text, or `{"text":"...","id":"optional"}` |
 | `meshcore/tx/dm/<name or pubkey prefix>` | in | plain text, or `{"text":"...","id":"optional"}` |
 | `meshcore/tx/result` | out | `{id, kind, target, ok, parts?, error?}` |
 
@@ -41,8 +41,23 @@ Test with mosquitto clients:
 
 ```sh
 mosquitto_sub -h <broker> -t 'meshcore/#' -v
-mosquitto_pub -h <broker> -t meshcore/tx/channel/1 -m 'hello from mqtt'
+mosquitto_pub -h <broker> -t meshcore/tx/channel/tapton -m 'hello from mqtt'
 ```
+
+## Channel topics use names, not indexes
+
+A channel's index is just its slot on the device, which changes if you re-add channels or move to a new device. Topics use a **slug** of the channel name instead: lowercased, spaces become `-`, and anything other than `a-z 0-9 - _` is removed (MQTT reserves `#` and `+`).
+
+| Channel name | Topic |
+|---|---|
+| `Public` | `meshcore/rx/channel/public` |
+| `#yorkshire` | `meshcore/rx/channel/yorkshire` |
+| `Tapton` | `meshcore/rx/channel/tapton` |
+
+- If two names give the same slug (for example `#tapton` and `Tapton`), the higher index gets `-<idx>` appended and a warning is logged.
+- Sending accepts the slug, the original name, or a numeric index.
+- The channel list is re-read on reconnect, when a message arrives on an unknown index, and when a send names an unknown channel.
+- When you move to a new device, add the channels with the same names (and, for private channels, the same secret). Topics stay the same.
 
 ## Airtime protection
 

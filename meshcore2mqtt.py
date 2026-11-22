@@ -8,12 +8,16 @@ Topics (PREFIX defaults to "meshcore"):
     {PREFIX}/status                 "online" / "offline"   (retained, MQTT LWT)
     {PREFIX}/node                   JSON node info + connected flag (retained)
     {PREFIX}/channels               JSON list of configured channels (retained)
-    {PREFIX}/rx/channel/{idx}       JSON for each received channel message
+    {PREFIX}/rx/channel/{slug}      JSON for each received channel message
     {PREFIX}/rx/dm/{pubkey_prefix}  JSON for each received direct message
     {PREFIX}/tx/result              JSON result of every send attempt
 
   Subscribed by the bridge
-    {PREFIX}/tx/channel/{idx}       send to channel idx
+    {PREFIX}/tx/channel/{slug|idx}  send to a channel by name slug (or index)
+
+  Channel slug = lowercased name with anything but a-z 0-9 - _ removed,
+  e.g. "#yorkshire" -> "yorkshire", "Tapton" -> "tapton". Names are stable
+  across devices; slot indexes are not.
     {PREFIX}/tx/dm/{name|pubkey}    send a DM to a contact (name or key prefix)
 
   TX payload is either plain text, or JSON: {"text": "...", "id": "optional"}
@@ -23,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import time
 from dataclasses import dataclass, field
@@ -83,6 +88,26 @@ class TxJob:
     queued_at: float = field(default_factory=time.time)
 
 
+def slugify(name: str) -> str:
+    """MQTT-safe channel slug: '#Yorkshire' -> 'yorkshire', 'Hope Valley' -> 'hope-valley'."""
+    s = re.sub(r"\s+", "-", (name or "").strip().lower())
+    return re.sub(r"[^a-z0-9_-]", "", s).strip("-")
+
+
+def build_slugs(channels: dict[int, str]) -> dict[int, str]:
+    """Map channel idx -> unique slug. On a collision the later index gets '-<idx>'."""
+    slugs, used = {}, set()
+    for idx, name in sorted(channels.items()):
+        slug = slugify(name) or f"ch{idx}"
+        if slug in used:
+            log.warning("Channel slug '%s' clashes (idx %d '%s'); using '%s-%d'",
+                        slug, idx, name, slug, idx)
+            slug = f"{slug}-{idx}"
+        used.add(slug)
+        slugs[idx] = slug
+    return slugs
+
+
 def split_text(text: str, max_bytes: int, max_parts: int) -> list[str]:
     """Split text into chunks of <= max_bytes UTF-8, preferring word boundaries."""
     text = " ".join(text.split())  # collapse whitespace/newlines
@@ -124,7 +149,9 @@ class Bridge:
         self.mc: MeshCore | None = None
         self.mqtt: aiomqtt.Client | None = None
         self.mc_ready = asyncio.Event()
-        self.channels: dict[int, str] = {}
+        self.channels: dict[int, str] = {}  # idx -> name
+        self.slugs: dict[int, str] = {}  # idx -> slug
+        self.channel_lock = asyncio.Lock()
         self.node_info: dict = {}
         self.tx_queue: asyncio.Queue[TxJob] = asyncio.Queue(maxsize=TX_QUEUE_SIZE)
         self.stopping = asyncio.Event()
@@ -150,7 +177,8 @@ class Bridge:
         )
         await self.publish(
             "channels",
-            [{"idx": i, "name": n} for i, n in sorted(self.channels.items())],
+            [{"idx": i, "name": n, "slug": self.slugs.get(i)}
+             for i, n in sorted(self.channels.items())],
             retain=True,
         )
 
@@ -158,6 +186,9 @@ class Bridge:
     async def on_channel_msg(self, event):
         p = event.payload
         idx = p.get("channel_idx")
+        if idx not in self.slugs:
+            await self.load_channels()  # channel added on the device since connect
+        slug = self.slugs.get(idx, f"ch{idx}")
         raw = p.get("text", "")
         # Channel messages arrive as "SenderName: message"
         sender, sep, text = raw.partition(": ")
@@ -166,6 +197,7 @@ class Bridge:
         msg = {
             "channel_idx": idx,
             "channel_name": self.channels.get(idx),
+            "channel_slug": slug,
             "sender": sender,
             "text": text,
             "raw_text": raw,
@@ -175,7 +207,7 @@ class Bridge:
             "received_at": int(time.time()),
         }
         log.info("RX ch%s [%s] %s: %s", idx, msg["channel_name"], sender, text)
-        await self.publish(f"rx/channel/{idx}", msg)
+        await self.publish(f"rx/channel/{slug}", msg)
 
     async def on_contact_msg(self, event):
         p = event.payload
@@ -195,19 +227,42 @@ class Bridge:
 
     # ---------------------------------------------------------- MeshCore loop
     async def load_channels(self):
-        self.channels = {}
-        for idx in range(MESHCORE_MAX_CHANNELS):
-            try:
-                res = await self.mc.commands.get_channel(idx)
-            except Exception as e:
-                log.debug("get_channel(%d) failed: %s", idx, e)
-                break
-            if res is None or res.type == EventType.ERROR:
-                break
-            name = res.payload.get("channel_name", "")
-            if name:
-                self.channels[idx] = name
-        log.info("Channels: %s", self.channels or "none")
+        """(Re)read the channel list from the device and rebuild the slug map."""
+        if self.mc is None:
+            return
+        async with self.channel_lock:
+            channels = {}
+            for idx in range(MESHCORE_MAX_CHANNELS):
+                try:
+                    res = await self.mc.commands.get_channel(idx)
+                except Exception as e:
+                    log.debug("get_channel(%d) failed: %s", idx, e)
+                    break
+                if res is None or res.type == EventType.ERROR:
+                    break
+                name = res.payload.get("channel_name", "")
+                if name:
+                    channels[idx] = name
+            changed = channels != self.channels
+            self.channels = channels
+            self.slugs = build_slugs(channels)
+            log.info("Channels: %s",
+                     {self.slugs[i]: i for i in sorted(channels)} or "none")
+        if changed and self.mc_ready.is_set():
+            await self.publish_node_state()
+
+    async def resolve_channel(self, target: str) -> int:
+        """Channel slug, name or numeric index -> idx. Refreshes the list once on a miss."""
+        if target.isdigit():
+            return int(target)
+        want = slugify(target)
+        for attempt in range(2):
+            for idx, slug in self.slugs.items():
+                if slug == want or slugify(self.channels.get(idx, "")) == want:
+                    return idx
+            if attempt == 0:
+                await self.load_channels()
+        raise LookupError(f"unknown channel '{target}'")
 
     async def meshcore_loop(self):
         while not self.stopping.is_set():
@@ -336,7 +391,7 @@ class Bridge:
     async def send_one(self, job: TxJob, part: str):
         mc = self.mc
         if job.kind == "channel":
-            res = await mc.commands.send_chan_msg(int(job.target), part)
+            res = await mc.commands.send_chan_msg(await self.resolve_channel(job.target), part)
         else:
             contact = await self.resolve_contact(job.target)
             if contact is None:
@@ -352,9 +407,6 @@ class Bridge:
             job = await self.tx_queue.get()
             result = {"id": job.id, "kind": job.kind, "target": job.target, "ok": False}
             try:
-                if job.kind == "channel" and not job.target.isdigit():
-                    raise ValueError("channel target must be a numeric index")
-
                 await self.mc_ready.wait()
                 if time.time() - job.queued_at > TX_MAX_AGE:
                     raise TimeoutError("message expired in queue")
