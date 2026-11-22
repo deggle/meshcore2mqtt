@@ -1,0 +1,18 @@
+services:
+  meshcore2mqtt:
+    build: .
+    image: meshcore2mqtt:latest
+    container_name: meshcore2mqtt
+    restart: unless-stopped
+    # Locally: copy .env.example to .env. In Komodo: set the variables in the
+    # Stack's Environment section (Komodo writes them to .env on deploy).
+    env_file:
+      - path: .env
+        required: false
+    # If Mosquitto runs in another compose project, join its network instead:
+    # networks: [mqtt]
+
+# networks:
+#   mqtt:
+#     external: true
+#     name: <your_mosquitto_network>
