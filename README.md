@@ -38,6 +38,9 @@ python meshcore2mqtt.py
 | `meshcore/tx/result` | out | `{id, kind, target, ok, parts?, error?}` |
 | `meshcore/cmd/advert` | in | empty for a zero-hop advert, `flood` for a flood advert |
 | `meshcore/cmd/refresh` | in | anything; re-reads contacts and channels |
+| `meshcore/cmd/contacts` | in | anything; publishes the contact list to `meshcore/contacts` |
+| `meshcore/contacts` | out | `{contacts: [{name, pubkey_prefix, type, last_advert, path}], pending: [...]}` |
+| `meshcore/cmd/add_contact` | in | name or key prefix of a pending advert |
 | `meshcore/cmd/result` | out | `{cmd, ok, error?, ...}` |
 
 Test with mosquitto clients:
@@ -65,7 +68,7 @@ A channel's index is just its slot on the device, which changes if you re-add ch
 ## Direct messages
 
 - DMs are sent with retries until the recipient ACKs: direct route first, then flood (`DM_MAX_ATTEMPTS`, default 3). If no ACK arrives, `tx/result` reports `ok: false`. The message may still have arrived; only the ACK was lost.
-- To DM the node, people need it in their contacts, so send an advert with `meshcore/cmd/advert`. The node must also know *them* to decrypt and reply, so turn on auto-add contacts on the device.
+- To DM the node, people need it in their contacts, so send an advert with `meshcore/cmd/advert`. The node must also know *them* to decrypt and reply, so turn on auto-add contacts on the device. If auto-add is off (`manual_add_contacts: true` on `meshcore/node`), adverts the bridge hears go to `pending` in `cmd/contacts`; add them with `cmd/add_contact`.
 - Contacts are kept in sync as adverts arrive, and re-read if a DM arrives from an unknown key.
 
 ## Airtime protection

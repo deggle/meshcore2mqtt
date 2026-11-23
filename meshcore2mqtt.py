@@ -71,7 +71,18 @@ TX_MAX_BYTES = env("TX_MAX_BYTES", 140, int)  # per-message UTF-8 byte limit
 TX_MAX_PARTS = env("TX_MAX_PARTS", 3, int)  # max chunks a long message is split into
 TX_MAX_AGE = env("TX_MAX_AGE", 120, int)  # drop queued sends older than this (s)
 TX_QUEUE_SIZE = env("TX_QUEUE_SIZE", 20, int)
-COMMANDS = ("advert", "refresh")  # {PREFIX}/cmd/<name> topics the bridge acts on
+COMMANDS = ("advert", "refresh", "contacts", "add_contact")  # {PREFIX}/cmd/<name> topics
+CONTACT_TYPES = {1: "chat", 2: "repeater", 3: "room", 4: "sensor"}
+
+
+def contact_summary(c: dict) -> dict:
+    return {
+        "name": c.get("adv_name", ""),
+        "pubkey_prefix": c.get("public_key", "")[:12],
+        "type": CONTACT_TYPES.get(c.get("type"), c.get("type")),
+        "last_advert": c.get("last_advert"),
+        "path": "flood" if c.get("out_path_len", -1) < 0 else f"{c.get('out_path_len')} hops",
+    }
 DM_MAX_ATTEMPTS = env("DM_MAX_ATTEMPTS", 3, int)  # DM retries until ACK (falls back to flood)
 
 RECONNECT_DELAY = env("RECONNECT_DELAY", 10, int)
@@ -291,6 +302,9 @@ class Bridge:
                 mc.subscribe(EventType.DISCONNECTED, lambda e: lost.set())
                 mc.subscribe(EventType.CHANNEL_MSG_RECV, self.on_channel_msg)
                 mc.subscribe(EventType.CONTACT_MSG_RECV, self.on_contact_msg)
+                mc.subscribe(EventType.NEW_CONTACT, lambda e: log.info(
+                    "Advert from %s (not auto-added; cmd/add_contact to add)",
+                    e.payload.get("adv_name")))
 
                 info = mc.self_info or {}
                 self.node_info = {
@@ -300,6 +314,7 @@ class Bridge:
                     "radio_bw": info.get("radio_bw"),
                     "radio_sf": info.get("radio_sf"),
                     "tx_power": info.get("tx_power"),
+                    "manual_add_contacts": info.get("manual_add_contacts"),
                 }
                 await mc.ensure_contacts()
                 mc.auto_update_contacts = True  # keep contacts synced as adverts arrive
@@ -338,8 +353,10 @@ class Bridge:
 
     # ------------------------------------------------------------- MQTT loop
     async def handle_cmd(self, cmd: str, arg: str):
-        """{PREFIX}/cmd/advert  (payload "flood" for a flood advert, else zero-hop)
-           {PREFIX}/cmd/refresh (re-read contacts and channels)"""
+        """{PREFIX}/cmd/advert       (payload "flood" for a flood advert, else zero-hop)
+           {PREFIX}/cmd/refresh      (re-read contacts and channels)
+           {PREFIX}/cmd/contacts     (publish contacts + pending adverts to {PREFIX}/contacts)
+           {PREFIX}/cmd/add_contact  (payload: name or key prefix of a pending advert)"""
         result = {"cmd": cmd, "ok": False}
         try:
             if not self.mc_ready.is_set():
@@ -356,6 +373,31 @@ class Bridge:
                 await self.load_channels()
                 await self.publish_node_state()
                 result.update(contacts=len(self.mc.contacts), channels=len(self.channels))
+            elif cmd == "contacts":
+                await self.mc.commands.get_contacts()
+                payload = {
+                    "contacts": [contact_summary(c) for c in self.mc.contacts.values()],
+                    "pending": [contact_summary(c) for c in self.mc.pending_contacts.values()],
+                }
+                payload["contacts"].sort(key=lambda c: c["name"].lower())
+                await self.publish("contacts", payload)
+                result.update(contacts=len(payload["contacts"]), pending=len(payload["pending"]))
+            elif cmd == "add_contact":
+                want = arg.strip()
+                if not want:
+                    raise ValueError("payload must be a pending contact's name or key prefix")
+                match = next((c for k, c in self.mc.pending_contacts.items()
+                              if c.get("adv_name", "").lower() == want.lower()
+                              or k.startswith(want.lower())), None)
+                if match is None:
+                    raise LookupError(f"'{want}' is not in pending adverts (see cmd/contacts)")
+                res = await self.mc.commands.add_contact(match)
+                if res is None or res.type == EventType.ERROR:
+                    raise RuntimeError("node rejected add_contact")
+                self.mc.pop_pending_contact(match["public_key"])
+                await self.mc.commands.get_contacts()
+                result["added"] = contact_summary(match)
+                log.info("Added contact %s", match.get("adv_name"))
             else:
                 raise ValueError(f"unknown command '{cmd}'")
             result["ok"] = True
